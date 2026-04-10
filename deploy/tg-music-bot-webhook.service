@@ -1,0 +1,15 @@
+[Unit]
+Description=TG Music Bot Webhook
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tg-music-bot
+EnvironmentFile=/opt/tg-music-bot/.env
+ExecStart=/opt/tg-music-bot/.venv/bin/python /opt/tg-music-bot/webhook_main.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
