@@ -75,7 +75,8 @@ HELP_TEXT = (
     "• показывает ремиксы\n"
     "• публикует найденный трек в канал\n"
     "• показывает историю публикаций\n"
-    "• даёт быстрые админ-инструменты\n\n"
+    "• даёт быстрые админ-инструменты\n"
+    "• листает результаты как карусель\n\n"
     "Команды:\n"
     "/start — открыть красивое меню\n"
     "/menu — открыть меню\n"
@@ -157,6 +158,12 @@ def fmt_duration(seconds):
 
 def thumbnail_url(video_id):
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+def safe_index(items, index):
+    if not items:
+        return 0
+    return max(0, min(len(items) - 1, index))
 
 
 def score(title, channel, desc, secs, views, query, remix=False):
@@ -331,10 +338,11 @@ def from_cache(cache_id):
     return item[1]
 
 
-def track_card(track, query, title="🎧 Лучшее совпадение"):
-    lines = [
-        title,
-        "",
+def track_card(track, query, title="🎧 Лучшее совпадение", index=None, total=None):
+    lines = [title, ""]
+    if index is not None and total is not None:
+        lines.append(f"📚 Позиция: {index + 1}/{total}")
+    lines += [
         f"🎵 {track['title']}",
         f"📺 Канал: {track['channel']}",
         f"⏱ Длительность: {fmt_duration(track['secs'])}",
@@ -348,19 +356,6 @@ def track_card(track, query, title="🎧 Лучшее совпадение"):
         track["url"],
     ]
     return "\n".join(lines)
-
-
-def remix_list_card(items, query):
-    lines = [f"🔥 Ремиксы по запросу: {query}", ""]
-    for i, track in enumerate(items[:3], 1):
-        lines += [
-            f"{i}. {track['title']}",
-            f"   📺 {track['channel']}",
-            f"   ⏱ {fmt_duration(track['secs'])}   🎯 {track['score']:.1f}",
-            f"   {track['url']}",
-            "",
-        ]
-    return "\n".join(lines).strip()
 
 
 def history_card(rows):
@@ -400,45 +395,83 @@ def admin_card(total_posts, unique_videos):
     )
 
 
-def selector_buttons(bundle_data, selected_idx=0):
-    rows = []
-    for i, track in enumerate(bundle_data["orig"][:3]):
-        icons = ["1️⃣", "2️⃣", "3️⃣"]
-        prefix = "✅" if i == selected_idx else icons[i]
-        rows.append({
-            "text": f"{prefix} {track['title'][:18]}",
-            "callback_data": f"sel|{bundle_data['id']}|{i}",
-        })
-    return rows
+def pager_nav_row(prefix, bundle_id, index, total):
+    if total <= 1:
+        return []
+    prev_button = (
+        {"text": "⬅️", "callback_data": f"{prefix}|{bundle_id}|{index - 1}"}
+        if index > 0
+        else {"text": "•", "callback_data": "noop"}
+    )
+    next_button = (
+        {"text": "➡️", "callback_data": f"{prefix}|{bundle_id}|{index + 1}"}
+        if index < total - 1
+        else {"text": "•", "callback_data": "noop"}
+    )
+    return [prev_button, {"text": f"{index + 1}/{total}", "callback_data": "noop"}, next_button]
 
 
-def main_inline(bundle_data, selected_idx=0):
+def pager_number_row(prefix, bundle_id, index, total):
+    if total <= 1:
+        return []
+    window = 5
+    start = max(0, index - 2)
+    end = min(total, start + window)
+    start = max(0, end - window)
+    buttons = []
+    for i in range(start, end):
+        text = f"✅ {i + 1}" if i == index else str(i + 1)
+        buttons.append({"text": text, "callback_data": f"{prefix}|{bundle_id}|{i}"})
+    return buttons
+
+
+def original_inline(bundle_data, selected_idx=0):
+    total = len(bundle_data["orig"])
+    selected_idx = safe_index(bundle_data["orig"], selected_idx)
     current = bundle_data["orig"][selected_idx]
-    return inline(
+    rows = [
         [
-            [
-                {"text": "▶️ Открыть", "url": current["url"]},
-                {"text": "📢 В канал", "callback_data": f"pubo|{bundle_data['id']}|{selected_idx}"},
-            ],
-            selector_buttons(bundle_data, selected_idx),
-            [
-                {"text": "🔥 Ремиксы", "callback_data": f"showr|{bundle_data['id']}"},
-                {"text": "🏠 Меню", "callback_data": "menu"},
-            ],
+            {"text": "▶️ Открыть", "url": current["url"]},
+            {"text": "📢 В канал", "callback_data": f"pubo|{bundle_data['id']}|{selected_idx}"},
+        ]
+    ]
+    nav_row = pager_nav_row("navo", bundle_data["id"], selected_idx, total)
+    if nav_row:
+        rows.append(nav_row)
+    num_row = pager_number_row("navo", bundle_data["id"], selected_idx, total)
+    if num_row:
+        rows.append(num_row)
+    rows.append(
+        [
+            {"text": "🔥 Ремиксы", "callback_data": f"showr|{bundle_data['id']}|0"},
+            {"text": "🏠 Меню", "callback_data": "menu"},
         ]
     )
+    return inline(rows)
 
 
-def remixes_inline(bundle_data):
-    rows = []
-    for i, track in enumerate(bundle_data["remix"][:3]):
-        rows.append(
-            [
-                {"text": f"▶️ Remix {i+1}", "url": track["url"]},
-                {"text": f"📢 Remix {i+1}", "callback_data": f"pubr|{bundle_data['id']}|{i}"},
-            ]
-        )
-    rows.append([{"text": "🏠 Меню", "callback_data": "menu"}])
+def remix_inline(bundle_data, selected_idx=0):
+    total = len(bundle_data["remix"])
+    selected_idx = safe_index(bundle_data["remix"], selected_idx)
+    current = bundle_data["remix"][selected_idx]
+    rows = [
+        [
+            {"text": "▶️ Открыть", "url": current["url"]},
+            {"text": "📢 В канал", "callback_data": f"pubr|{bundle_data['id']}|{selected_idx}"},
+        ]
+    ]
+    nav_row = pager_nav_row("navr", bundle_data["id"], selected_idx, total)
+    if nav_row:
+        rows.append(nav_row)
+    num_row = pager_number_row("navr", bundle_data["id"], selected_idx, total)
+    if num_row:
+        rows.append(num_row)
+    rows.append(
+        [
+            {"text": "🎧 Оригиналы", "callback_data": f"showo|{bundle_data['id']}|0"},
+            {"text": "🏠 Меню", "callback_data": "menu"},
+        ]
+    )
     return inline(rows)
 
 
@@ -473,23 +506,40 @@ async def ask_for_query(chat_id, mode):
     return await send_text(chat_id, titles[mode], reply_markup=cancel_keyboard())
 
 
-async def handle_original(chat_id, query):
-    data = await bundle(query)
-    if not data["orig"]:
+async def show_original_result(chat_id, bundle_data, index=0):
+    if not bundle_data["orig"]:
         return await send_text(chat_id, "😕 Ничего не нашёл. Попробуй уточнить запрос.", reply_markup=main_menu_keyboard())
+    index = safe_index(bundle_data["orig"], index)
+    track = bundle_data["orig"][index]
     return await send_track_preview(
         chat_id,
-        data["orig"][0],
-        track_card(data["orig"][0], query, "✨ Лучший оригинал"),
-        reply_markup=main_inline(data, 0),
+        track,
+        track_card(track, bundle_data["query"], "✨ Оригинал", index, len(bundle_data["orig"])),
+        reply_markup=original_inline(bundle_data, index),
     )
+
+
+async def show_remix_result(chat_id, bundle_data, index=0):
+    if not bundle_data["remix"]:
+        return await send_text(chat_id, "😕 Ремиксы не нашёл. Попробуй другой запрос.", reply_markup=main_menu_keyboard())
+    index = safe_index(bundle_data["remix"], index)
+    track = bundle_data["remix"][index]
+    return await send_track_preview(
+        chat_id,
+        track,
+        track_card(track, bundle_data["query"], "🔥 Ремикс", index, len(bundle_data["remix"])),
+        reply_markup=remix_inline(bundle_data, index),
+    )
+
+
+async def handle_original(chat_id, query):
+    data = await bundle(query)
+    return await show_original_result(chat_id, data, 0)
 
 
 async def handle_remix(chat_id, query):
     data = await bundle(query)
-    if not data["remix"]:
-        return await send_text(chat_id, "😕 Ремиксы не нашёл. Попробуй другой запрос.", reply_markup=main_menu_keyboard())
-    return await send_text(chat_id, remix_list_card(data["remix"], query), reply_markup=remixes_inline(data))
+    return await show_remix_result(chat_id, data, 0)
 
 
 async def handle_publish(chat_id, query):
@@ -725,6 +775,8 @@ async def process_callback(callback):
     message = callback.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
 
+    if data == "noop":
+        return await answer_callback(callback_id, "")
     if data == "menu":
         await answer_callback(callback_id, "Открываю меню")
         return await show_menu(chat_id)
@@ -744,24 +796,24 @@ async def process_callback(callback):
 
     try:
         if action == "showr":
-            await answer_callback(callback_id, "Показываю ремиксы")
-            return await send_text(chat_id, remix_list_card(bundle_data["remix"], bundle_data["query"]), reply_markup=remixes_inline(bundle_data))
-        if action == "sel":
             index = int(parts[2]) if len(parts) > 2 else 0
-            if index >= len(bundle_data["orig"]):
-                return await answer_callback(callback_id, "Вариант не найден", True)
-            await answer_callback(callback_id, f"Выбран вариант {index + 1}")
-            track = bundle_data["orig"][index]
-            return await send_track_preview(
-                chat_id,
-                track,
-                track_card(track, bundle_data["query"], f"✨ Оригинал #{index + 1}"),
-                reply_markup=main_inline(bundle_data, index),
-            )
+            await answer_callback(callback_id, "Показываю ремиксы")
+            return await show_remix_result(chat_id, bundle_data, index)
+        if action == "showo":
+            index = int(parts[2]) if len(parts) > 2 else 0
+            await answer_callback(callback_id, "Показываю оригиналы")
+            return await show_original_result(chat_id, bundle_data, index)
+        if action == "navo":
+            index = int(parts[2]) if len(parts) > 2 else 0
+            await answer_callback(callback_id, f"Оригинал {safe_index(bundle_data['orig'], index) + 1}")
+            return await show_original_result(chat_id, bundle_data, index)
+        if action == "navr":
+            index = int(parts[2]) if len(parts) > 2 else 0
+            await answer_callback(callback_id, f"Ремикс {safe_index(bundle_data['remix'], index) + 1}")
+            return await show_remix_result(chat_id, bundle_data, index)
         if action == "pubo":
             index = int(parts[2]) if len(parts) > 2 else 0
-            if index >= len(bundle_data["orig"]):
-                return await answer_callback(callback_id, "Вариант не найден", True)
+            index = safe_index(bundle_data["orig"], index)
             result = await publish(bundle_data["orig"][index], bundle_data["query"], "ORIGINAL", False)
             if result["status"] == "dup":
                 await answer_callback(callback_id, "Уже публиковался", True)
@@ -779,8 +831,7 @@ async def process_callback(callback):
             return await send_text(chat_id, "✅ Оригинал отправлен в канал.", reply_markup=main_menu_keyboard())
         if action == "pubr":
             index = int(parts[2]) if len(parts) > 2 else 0
-            if index >= len(bundle_data["remix"]):
-                return await answer_callback(callback_id, "Ремикс не найден", True)
+            index = safe_index(bundle_data["remix"], index)
             result = await publish(bundle_data["remix"][index], bundle_data["query"], "REMIX", False)
             if result["status"] == "dup":
                 await answer_callback(callback_id, "Уже публиковался", True)
