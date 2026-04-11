@@ -21,6 +21,11 @@ MAXR = int(os.getenv("SEARCH_MAX_RESULTS", "10"))
 TTL = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 DB = os.getenv("DATABASE_PATH", "data/music_bot.db").strip() or "data/music_bot.db"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "25"))
+ADMIN_USER_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_USER_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
 
 if not BOT or not YT or not PUB:
     raise RuntimeError("Fill TELEGRAM_BOT_TOKEN, YOUTUBE_API_KEY, PUBLISH_CHAT_ID")
@@ -58,6 +63,7 @@ BTN_FIND = "🎧 Найти оригинал"
 BTN_REMIX = "🔥 Найти ремиксы"
 BTN_PUBLISH = "📢 Опубликовать в канал"
 BTN_HISTORY = "🕘 История"
+BTN_ADMIN = "⚙️ Админ-панель"
 BTN_HELP = "ℹ️ Помощь"
 BTN_MENU = "🏠 Меню"
 BTN_CANCEL = "❌ Отмена"
@@ -68,9 +74,10 @@ HELP_TEXT = (
     "• ищет оригинальные версии треков\n"
     "• показывает ремиксы\n"
     "• публикует найденный трек в канал\n"
-    "• хранит историю публикаций\n\n"
+    "• показывает историю публикаций\n"
+    "• даёт быстрые админ-инструменты\n\n"
     "Команды:\n"
-    "/start — красивое главное меню\n"
+    "/start — открыть красивое меню\n"
     "/menu — открыть меню\n"
     "/orig <запрос> — найти оригинал\n"
     "/remix <запрос> — найти ремиксы\n"
@@ -78,6 +85,7 @@ HELP_TEXT = (
     "/add <запрос> — сразу опубликовать оригинал\n"
     "/history [N] — последние публикации\n"
     "/republish <video_id> — повторная публикация\n"
+    "/admin — админ-панель\n"
     "/help — помощь"
 )
 
@@ -93,7 +101,7 @@ def main_menu_keyboard():
         "keyboard": [
             [{"text": BTN_FIND}, {"text": BTN_REMIX}],
             [{"text": BTN_PUBLISH}, {"text": BTN_HISTORY}],
-            [{"text": BTN_HELP}],
+            [{"text": BTN_ADMIN}, {"text": BTN_HELP}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -147,6 +155,10 @@ def fmt_duration(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def thumbnail_url(video_id):
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 def score(title, channel, desc, secs, views, query, remix=False):
     hay = norm(f"{title} {channel} {desc}")
     title_norm = norm(title)
@@ -190,6 +202,10 @@ def get_state(chat_id):
     return user_state.get(chat_id)
 
 
+def is_admin(chat_id):
+    return not ADMIN_USER_IDS or chat_id in ADMIN_USER_IDS
+
+
 async def tg(method, payload):
     response = await http.post(f"{API}/{method}", json=payload)
     response.raise_for_status()
@@ -208,6 +224,20 @@ async def send_text(chat_id, text, reply_markup=None, disable_preview=True):
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     return await tg("sendMessage", payload)
+
+
+async def send_photo(chat_id, photo, caption, reply_markup=None):
+    payload = {"chat_id": chat_id, "photo": photo, "caption": caption}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    return await tg("sendPhoto", payload)
+
+
+async def send_track_preview(chat_id, track, caption, reply_markup=None):
+    try:
+        return await send_photo(chat_id, thumbnail_url(track["video_id"]), caption, reply_markup)
+    except Exception:
+        return await send_text(chat_id, caption, reply_markup=reply_markup)
 
 
 async def answer_callback(callback_id, text, alert=False):
@@ -358,34 +388,39 @@ def duplicate_card(row):
     )
 
 
-async def publish(track, query, label, allow=False):
-    old = q1("SELECT * FROM pub WHERE video_id=? ORDER BY id DESC LIMIT 1", (track["video_id"],))
-    if old and not allow:
-        return {"status": "dup", "row": old}
-    post = await send_text(
-        PUB,
-        (
-            "📢 Публикация в канал\n\n"
-            f"🎵 {track['title']}\n"
-            f"📺 YouTube-канал: {track['channel']}\n"
-            f"🏷 Тип: {label}\n"
-            f"🔎 Запрос: {query}\n\n"
-            f"{track['url']}"
-        ),
-        reply_markup=inline([[{"text": "▶️ Открыть в YouTube", "url": track["url"]}]]),
+def admin_card(total_posts, unique_videos):
+    scope = "все пользователи" if not ADMIN_USER_IDS else ", ".join(str(x) for x in sorted(ADMIN_USER_IDS))
+    return (
+        "⚙️ Админ-панель\n\n"
+        f"📢 Канал публикации: {PUB}\n"
+        f"🗃 База: {DB}\n"
+        f"🧾 Всего публикаций: {total_posts}\n"
+        f"🎬 Уникальных видео: {unique_videos}\n"
+        f"👤 Доступ: {scope}"
     )
-    add_pub(track["video_id"], track["title"], track["channel"], track["url"], query, label, post.get("message_id"))
-    return {"status": "ok", "post": post}
 
 
-def main_inline(bundle_data):
-    best = bundle_data["orig"][0]
+def selector_buttons(bundle_data, selected_idx=0):
+    rows = []
+    for i, track in enumerate(bundle_data["orig"][:3]):
+        icons = ["1️⃣", "2️⃣", "3️⃣"]
+        prefix = "✅" if i == selected_idx else icons[i]
+        rows.append({
+            "text": f"{prefix} {track['title'][:18]}",
+            "callback_data": f"sel|{bundle_data['id']}|{i}",
+        })
+    return rows
+
+
+def main_inline(bundle_data, selected_idx=0):
+    current = bundle_data["orig"][selected_idx]
     return inline(
         [
             [
-                {"text": "▶️ Открыть", "url": best["url"]},
-                {"text": "📢 В канал", "callback_data": f"pubo|{bundle_data['id']}"},
+                {"text": "▶️ Открыть", "url": current["url"]},
+                {"text": "📢 В канал", "callback_data": f"pubo|{bundle_data['id']}|{selected_idx}"},
             ],
+            selector_buttons(bundle_data, selected_idx),
             [
                 {"text": "🔥 Ремиксы", "callback_data": f"showr|{bundle_data['id']}"},
                 {"text": "🏠 Меню", "callback_data": "menu"},
@@ -405,6 +440,21 @@ def remixes_inline(bundle_data):
         )
     rows.append([{"text": "🏠 Меню", "callback_data": "menu"}])
     return inline(rows)
+
+
+def admin_inline():
+    return inline(
+        [
+            [
+                {"text": "📡 Статус канала", "callback_data": "admin|status"},
+                {"text": "🕘 Последние 5", "callback_data": "admin|recent"},
+            ],
+            [
+                {"text": "🧪 Тест-пост", "callback_data": "admin|test"},
+                {"text": "🏠 Меню", "callback_data": "menu"},
+            ],
+        ]
+    )
 
 
 async def show_menu(chat_id, text=None):
@@ -427,7 +477,12 @@ async def handle_original(chat_id, query):
     data = await bundle(query)
     if not data["orig"]:
         return await send_text(chat_id, "😕 Ничего не нашёл. Попробуй уточнить запрос.", reply_markup=main_menu_keyboard())
-    return await send_text(chat_id, track_card(data["orig"][0], query, "✨ Лучший оригинал"), reply_markup=main_inline(data))
+    return await send_track_preview(
+        chat_id,
+        data["orig"][0],
+        track_card(data["orig"][0], query, "✨ Лучший оригинал"),
+        reply_markup=main_inline(data, 0),
+    )
 
 
 async def handle_remix(chat_id, query):
@@ -454,8 +509,9 @@ async def handle_publish(chat_id, query):
                 ]
             ),
         )
-    return await send_text(
+    return await send_track_preview(
         chat_id,
+        best,
         (
             "✅ Трек опубликован\n\n"
             f"🎵 {best['title']}\n"
@@ -504,6 +560,78 @@ async def handle_republish(chat_id, video_id):
     )
 
 
+async def publish(track, query, label, allow=False):
+    old = q1("SELECT * FROM pub WHERE video_id=? ORDER BY id DESC LIMIT 1", (track["video_id"],))
+    if old and not allow:
+        return {"status": "dup", "row": old}
+    caption = (
+        "📢 Публикация в канал\n\n"
+        f"🎵 {track['title']}\n"
+        f"📺 YouTube-канал: {track['channel']}\n"
+        f"🏷 Тип: {label}\n"
+        f"🔎 Запрос: {query}\n\n"
+        f"{track['url']}"
+    )
+    try:
+        post = await send_photo(
+            PUB,
+            thumbnail_url(track["video_id"]),
+            caption,
+            reply_markup=inline([[{"text": "▶️ Открыть в YouTube", "url": track["url"]}]]),
+        )
+    except Exception:
+        post = await send_text(
+            PUB,
+            caption,
+            reply_markup=inline([[{"text": "▶️ Открыть в YouTube", "url": track["url"]}]]),
+        )
+    add_pub(track["video_id"], track["title"], track["channel"], track["url"], query, label, post.get("message_id"))
+    return {"status": "ok", "post": post}
+
+
+async def show_admin_panel(chat_id):
+    if not is_admin(chat_id):
+        return await send_text(chat_id, "⛔️ Нет доступа к админ-панели.", reply_markup=main_menu_keyboard())
+    total_posts = q1("SELECT COUNT(*) AS c FROM pub")["c"]
+    unique_videos = q1("SELECT COUNT(DISTINCT video_id) AS c FROM pub")["c"]
+    return await send_text(chat_id, admin_card(total_posts, unique_videos), reply_markup=admin_inline())
+
+
+async def handle_admin_action(chat_id, action):
+    if not is_admin(chat_id):
+        return await send_text(chat_id, "⛔️ Нет доступа к админ-панели.", reply_markup=main_menu_keyboard())
+    if action == "status":
+        try:
+            chat = await tg("getChat", {"chat_id": PUB})
+            username = f"@{chat.get('username')}" if chat.get("username") else "—"
+            text = (
+                "📡 Статус канала\n\n"
+                f"Название: {chat.get('title', '—')}\n"
+                f"Тип: {chat.get('type', '—')}\n"
+                f"Username: {username}"
+            )
+            return await send_text(chat_id, text, reply_markup=admin_inline())
+        except Exception as exc:
+            return await send_text(chat_id, f"Не смог получить статус канала:\n{exc}", reply_markup=admin_inline())
+    if action == "recent":
+        rows = qall("SELECT * FROM pub ORDER BY id DESC LIMIT 5")
+        if not rows:
+            return await send_text(chat_id, "Публикаций пока нет.", reply_markup=admin_inline())
+        return await send_text(chat_id, history_card(rows), reply_markup=admin_inline())
+    if action == "test":
+        payload = (
+            "🧪 Тестовый пост из админ-панели\n\n"
+            f"Канал: {PUB}\n"
+            f"Время: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        try:
+            await send_text(PUB, payload)
+            return await send_text(chat_id, "✅ Тестовый пост отправлен в канал.", reply_markup=admin_inline())
+        except Exception as exc:
+            return await send_text(chat_id, f"Не смог отправить тест-пост:\n{exc}", reply_markup=admin_inline())
+    return await send_text(chat_id, "Неизвестное действие админ-панели.", reply_markup=admin_inline())
+
+
 async def setup_bot():
     await tg(
         "setMyCommands",
@@ -517,6 +645,7 @@ async def setup_bot():
                 {"command": "add", "description": "Опубликовать оригинал в канал"},
                 {"command": "history", "description": "Показать историю публикаций"},
                 {"command": "republish", "description": "Переопубликовать по video_id"},
+                {"command": "admin", "description": "Админ-панель"},
                 {"command": "help", "description": "Помощь"},
             ]
         },
@@ -537,6 +666,8 @@ async def process_text_message(message):
         return await ask_for_query(chat_id, "publish")
     if text == BTN_HISTORY:
         return await handle_history(chat_id, "10")
+    if text == BTN_ADMIN:
+        return await show_admin_panel(chat_id)
     if text == BTN_HELP:
         return await send_text(chat_id, HELP_TEXT, reply_markup=main_menu_keyboard())
     if text in [BTN_MENU, BTN_CANCEL]:
@@ -556,6 +687,8 @@ async def process_text_message(message):
             return await handle_history(chat_id, arg or "10")
         if cmd == "/republish":
             return await handle_republish(chat_id, arg)
+        if cmd == "/admin":
+            return await show_admin_panel(chat_id)
         if cmd in ["/orig", "/find"]:
             clear_state(chat_id)
             if not arg:
@@ -596,6 +729,10 @@ async def process_callback(callback):
         await answer_callback(callback_id, "Открываю меню")
         return await show_menu(chat_id)
 
+    if data.startswith("admin|"):
+        await answer_callback(callback_id, "Открываю раздел")
+        return await handle_admin_action(chat_id, data.split("|", 1)[1])
+
     parts = data.split("|")
     if len(parts) < 2:
         return await answer_callback(callback_id, "Некорректная кнопка", True)
@@ -609,8 +746,23 @@ async def process_callback(callback):
         if action == "showr":
             await answer_callback(callback_id, "Показываю ремиксы")
             return await send_text(chat_id, remix_list_card(bundle_data["remix"], bundle_data["query"]), reply_markup=remixes_inline(bundle_data))
+        if action == "sel":
+            index = int(parts[2]) if len(parts) > 2 else 0
+            if index >= len(bundle_data["orig"]):
+                return await answer_callback(callback_id, "Вариант не найден", True)
+            await answer_callback(callback_id, f"Выбран вариант {index + 1}")
+            track = bundle_data["orig"][index]
+            return await send_track_preview(
+                chat_id,
+                track,
+                track_card(track, bundle_data["query"], f"✨ Оригинал #{index + 1}"),
+                reply_markup=main_inline(bundle_data, index),
+            )
         if action == "pubo":
-            result = await publish(bundle_data["orig"][0], bundle_data["query"], "ORIGINAL", False)
+            index = int(parts[2]) if len(parts) > 2 else 0
+            if index >= len(bundle_data["orig"]):
+                return await answer_callback(callback_id, "Вариант не найден", True)
+            result = await publish(bundle_data["orig"][index], bundle_data["query"], "ORIGINAL", False)
             if result["status"] == "dup":
                 await answer_callback(callback_id, "Уже публиковался", True)
                 return await send_text(
